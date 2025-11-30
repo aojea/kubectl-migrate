@@ -1,0 +1,44 @@
+name: bats
+
+on:
+  push:
+    branches:
+      - 'main'
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.24"
+  K8S_VERSION: "v1.34.0"
+  KIND_VERSION: "v0.30.0"
+
+jobs:
+  bats_tests:
+    runs-on: ubuntu-22.04
+    name: Bats e2e tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Setup Bats and bats libs
+        id: setup-bats
+        uses: bats-core/bats-action@42fcc8700f773c075a16a90eb11674c0318ad507 # 3.0.1
+
+      - name: Bats tests
+        shell: bash
+        env:
+         BATS_LIB_PATH: ${{ steps.setup-bats.outputs.lib-path }}
+         TERM: xterm
+        run: |
+          bats -o _artifacts tests/
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: kind-logs-${{ env.JOB_NAME }}-${{ github.run_id }}
+          path: |
+            ./_artifacts
+ 

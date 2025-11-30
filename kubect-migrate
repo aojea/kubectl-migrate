@@ -1,0 +1,151 @@
+#!/bin/bash
+set -e
+
+# =============================================================================
+# kubectl-migrate
+# Live-migrate with Optimistic Scheduling
+# =============================================================================
+
+function usage() {
+    echo "Usage: kubectl migrate [POD_NAME] [TARGET_IMAGE] [OPTIONS]"
+    echo ""
+    echo "Arguments:"
+    echo "  POD_NAME       The name of the pod to migrate"
+    echo "  TARGET_IMAGE   The registry path (e.g. myreg.com/app:ckpt-1)"
+    echo ""
+    echo "Options:"
+    echo "  -n, --namespace  Namespace (default: default)"
+    echo "  -c, --container  Specific container to checkpoint (default: first found)"
+    echo "  -s, --selector   Node selector for new pod (e.g. 'disktype=ssd')"
+    echo "  --keep-old       Do not delete old pod"
+    exit 1
+}
+
+if ! command -v jq &> /dev/null; then
+    echo "❌ Error: 'jq' is not installed."
+    exit 1
+fi
+
+POD_NAME=$1
+TARGET_IMAGE=$2
+NAMESPACE="default"
+CONTAINER_NAME=""
+SELECTOR=""
+DELETE_OLD=true
+
+if [[ -z "$POD_NAME" || -z "$TARGET_IMAGE" ]]; then usage; fi
+
+shift 2
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -n|--namespace) NAMESPACE="$2"; shift ;;
+        -c|--container) CONTAINER_NAME="$2"; shift ;;
+        -s|--selector) SELECTOR="$2"; shift ;;
+        --keep-old) DELETE_OLD=false ;;
+        *) usage ;;
+    esac
+    shift
+done
+
+echo "🔍  Pre-flight checks..."
+NODE=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}')
+if [[ -z "$NODE" ]]; then echo "❌ Pod not found"; exit 1; fi
+
+AVAILABLE_CONTAINERS=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.containers[*].name}')
+if [[ -z "$CONTAINER_NAME" ]]; then
+    CONTAINER_NAME=$(echo "$AVAILABLE_CONTAINERS" | awk '{print $1}')
+fi
+echo "📍  Target: $NODE / $CONTAINER_NAME"
+
+echo "📝  Pre-calculating new Pod manifest..."
+NEW_POD_NAME="$POD_NAME-migrated"
+kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o json | jq \
+    --arg IMAGE "$TARGET_IMAGE" \
+    --arg NAME "$NEW_POD_NAME" \
+    --arg SELECTOR "$SELECTOR" \
+    --arg TARGET_CONT "$CONTAINER_NAME" \
+    '
+    del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.ownerReferences, .spec.nodeName) |
+    .metadata.name = $NAME |
+    (.spec.containers[] | select(.name == $TARGET_CONT).image) |= $IMAGE |
+    if $SELECTOR != "" then
+       (.spec.nodeSelector += { ($SELECTOR | split("=")[0]): ($SELECTOR | split("=")[1]) })
+    else . end
+    ' > migrated-pod.json
+
+BUILDER_POD="migrator-builder-$RANDOM"
+echo "🚀  Pre-warming builder ($BUILDER_POD)..."
+cat <<EOF | kubectl apply -f - > /dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $BUILDER_POD
+  namespace: $NAMESPACE
+spec:
+  nodeName: $NODE
+  restartPolicy: Never
+  containers:
+  - name: builder
+    image: quay.io/buildah/stable:latest
+    command: ["sleep", "300"]
+    securityContext: { privileged: true }
+    volumeMounts: [{ name: h, mountPath: /host }]
+  volumes: [{ name: h, hostPath: { path: /, type: Directory } }]
+EOF
+
+# Wait for builder (Critical Block)
+echo "⏳  Waiting for builder..."
+kubectl wait --for=condition=Ready pod/"$BUILDER_POD" -n "$NAMESPACE" --timeout=60s > /dev/null
+
+echo "📸  TRIGGERING CHECKPOINT..."
+# The clock starts NOW.
+CHECKPOINT_RESP=$(echo '{}' | kubectl create --raw "/api/v1/nodes/$NODE/proxy/checkpoint/$NAMESPACE/$POD_NAME/$CONTAINER_NAME" -f -)
+CHECKPOINT_PATH=$(echo "$CHECKPOINT_RESP" | jq -r '.items[0]')
+
+if [[ -z "$CHECKPOINT_PATH" || "$CHECKPOINT_PATH" == "null" ]]; then
+    echo "❌ Checkpoint failed: $CHECKPOINT_RESP"; exit 1
+fi
+echo "✅  Saved: $CHECKPOINT_PATH"
+
+echo "⚡  ENTERING PARALLEL EXECUTION MODE"
+
+# TASK A: THE HEAVY LIFT (Background)
+# We run the build/push in the background using '&'
+(
+    echo "   [Thread A] 📦 Packaging & Pushing Image..."
+    REMOTE_SCRIPT="
+    set -e
+    # Buildah logic
+    if ! buildah login --get-login $TARGET_IMAGE >/dev/null 2>&1; then echo 'Warn: No auth'; fi
+    ctr=\$(buildah from scratch)
+    buildah add \"\$ctr\" \"/host$CHECKPOINT_PATH\" /
+    buildah config --annotation=org.criu.checkpoint.container.name=restored \"\$ctr\"
+    buildah commit \"\$ctr\" \"$TARGET_IMAGE\"
+    buildah push \"$TARGET_IMAGE\"
+    "
+    if kubectl exec "$BUILDER_POD" -n "$NAMESPACE" -- /bin/bash -c "$REMOTE_SCRIPT" > /dev/null; then
+        echo "   [Thread A] ✅ Image Push Complete."
+    else
+        echo "   [Thread A] ❌ Image Push Failed!"
+        exit 1
+    fi
+) &
+PID_PUSH=$!
+
+# TASK B: THE SCHEDULING (Foreground)
+# We apply the pod IMMEDIATELY. It will go into ImagePullBackOff until Thread A finishes.
+echo "   [Thread B] 🚀 Scheduling new Pod $NEW_POD_NAME..."
+
+if [ "$DELETE_OLD" = true ]; then
+    # We delete with --wait=false so we don't block the new pod creation
+    echo "   [Thread B] 🗑️  Deleting old pod (non-blocking)..."
+    kubectl delete pod "$POD_NAME" -n "$NAMESPACE" --wait=false > /dev/null
+fi
+
+# Apply the new manifest
+kubectl apply -f migrated-pod.json > /dev/null
+echo "   [Thread B] ⏳ Pod created. Kubelet is now polling for image..."
+
+echo "🔗  Waiting for Push to finish..."
+wait $PID_PUSH
+PUSH_STATUS=$?
