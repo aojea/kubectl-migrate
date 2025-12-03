@@ -4,7 +4,6 @@ load 'test_helper/bats-support/load'
 load 'test_helper/bats-assert/load'
 
 setup() {
-    kubectl config use-context "kind-$KIND_CLUSTER_NAME"
     # Generate a unique ID for this test run to ensure isolation
     export RUN_ID="test-$RANDOM"
     export NS="ns-$RUN_ID"

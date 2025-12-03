@@ -6,6 +6,10 @@ set -e
 # Live-migrate with Optimistic Scheduling
 # =============================================================================
 
+# Default builder image (can be overridden by BUILDER_IMAGE env var)
+# This image is expected to have 'buildah' and 'criu' installed.
+BUILDER_IMAGE=${BUILDER_IMAGE:-"aojea/kubectl-migrate:v0.0.1"}
+
 function usage() {
     echo "Usage: kubectl migrate [POD_NAME] [TARGET_IMAGE] [OPTIONS]"
     echo ""
@@ -18,8 +22,22 @@ function usage() {
     echo "  -c, --container  Specific container to checkpoint (default: first found)"
     echo "  -s, --selector   Node selector for new pod (e.g. 'disktype=ssd')"
     echo "  --keep-old       Do not delete old pod"
+    echo ""
+    echo "Environment Variables:"
+    echo "  BUILDER_IMAGE    Image used for the builder pod (default: $BUILDER_IMAGE)"
+    echo "                   Must contain 'buildah' and 'criu'."
     exit 1
 }
+
+function cleanup() {
+    if [[ -n "$BUILDER_POD" ]]; then
+        echo "🧹 Cleaning up builder pod and injected binaries..."
+        # Try to remove the injected binary using the builder pod if it's still running
+        kubectl exec "$BUILDER_POD" -n "$NAMESPACE" -- rm -f /host/usr/local/bin/criu 2>/dev/null || true
+        kubectl delete pod "$BUILDER_POD" -n "$NAMESPACE" --wait=false 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
 if ! command -v jq &> /dev/null; then
     echo "❌ Error: 'jq' is not installed."
@@ -86,8 +104,8 @@ spec:
   restartPolicy: Never
   containers:
   - name: builder
-    image: quay.io/buildah/stable:latest
-    command: ["sleep", "300"]
+    image: $BUILDER_IMAGE
+    command: ["/bin/sh", "-c", "cp \$(command -v criu) /host/usr/local/bin/criu && sleep 900"]
     securityContext: { privileged: true }
     volumeMounts: [{ name: h, mountPath: /host }]
   volumes: [{ name: h, hostPath: { path: /, type: Directory } }]
@@ -149,3 +167,10 @@ echo "   [Thread B] ⏳ Pod created. Kubelet is now polling for image..."
 echo "🔗  Waiting for Push to finish..."
 wait $PID_PUSH
 PUSH_STATUS=$?
+
+if [ $PUSH_STATUS -eq 0 ]; then
+    echo "🎉 Migration Complete!"
+else
+    echo "❌ Migration Failed during push."
+    exit 1
+fi
